@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import "./App.css";
 
 import * as duckdb from "@duckdb/duckdb-wasm";
@@ -93,6 +93,7 @@ function App() {
   const duckdbInitialized = useRef(false);
   const [myDuckDB, setMyDuckDB] = useState<duckdb.AsyncDuckDB | null>(null);
   const [resultRows, setResultRows] = useState<StructRowProxy<any>[]>([]);
+  const debounceTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (textEmbedderInitialized.current) return;
@@ -111,18 +112,42 @@ function App() {
     }
   }, [myTextEmbedder]);
 
+  // クエリをdebounceする処理
+  const debouncedEmbedQuery = useCallback(
+    (query: string) => {
+      if (!myTextEmbedder) return;
+
+      if (debounceTimerRef.current !== null) {
+        window.clearTimeout(debounceTimerRef.current);
+      }
+
+      debounceTimerRef.current = window.setTimeout(() => {
+        console.log("Embedding query after debounce:", query);
+        const newQueryEmbedding = myTextEmbedder.embed(query);
+        setQueryEmbedding(newQueryEmbedding);
+        console.log(
+          "Query embedding:",
+          newQueryEmbedding.embeddings[0].floatEmbedding?.length
+        );
+        debounceTimerRef.current = null;
+      }, 800);
+    },
+    [myTextEmbedder]
+  );
+
   useEffect(() => {
     if (!query) return;
     if (!myTextEmbedder) return;
 
-    const newQueryEmbedding = myTextEmbedder.embed(query);
-    setQueryEmbedding(newQueryEmbedding);
+    debouncedEmbedQuery(query);
 
-    console.log(
-      "Query embedding:",
-      newQueryEmbedding.embeddings[0].floatEmbedding?.length
-    );
-  }, [query, myTextEmbedder]);
+    // クリーンアップ関数
+    return () => {
+      if (debounceTimerRef.current !== null) {
+        window.clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, [query, myTextEmbedder, debouncedEmbedQuery]);
 
   useEffect(() => {
     const doit = async () => {
