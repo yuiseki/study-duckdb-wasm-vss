@@ -31,7 +31,9 @@ type ModelConfig =
       backend: "transformers";
       modelId: string;
       dtype: string;
-      // e5 系は接頭辞が必要
+      // プーリング方式。e5 系は mean、granite 系は cls
+      pooling: "mean" | "cls";
+      // e5 系は "query: " / "passage: " 接頭辞が必要。granite 系は不要
       usePrefix: boolean;
     };
 
@@ -39,19 +41,58 @@ type ModelConfig =
 // 空白で区切られない日本語文はすべて未知語となり同一ベクトルに潰れる(=検索が機能しない)。
 // 日本語で意味のある結果が得られるのは BERT(文字レベル分割) か Transformers.js の多言語モデル。
 const EMBEDDING_MODELS: ModelConfig[] = [
+  // granite 系(IBM, Apache-2.0)。多言語(日本語含む)対応、CLS プーリング、接頭辞なし。
+  // ONNX は yuiseki 自身が Apache-2.0 明示で再ホストしたもの。
+  {
+    id: "granite-97m-r2",
+    label: "granite-embedding-97m-multilingual-r2（多言語・Apache-2.0・約93MB・推奨）",
+    backend: "transformers",
+    modelId: "yuiseki/granite-embedding-97m-multilingual-r2-ONNX",
+    dtype: "q8",
+    pooling: "cls",
+    usePrefix: false,
+  },
+  {
+    id: "granite-107m",
+    label: "granite-embedding-107m-multilingual（多言語・Apache-2.0・約102MB）",
+    backend: "transformers",
+    modelId: "yuiseki/granite-embedding-107m-multilingual-ONNX",
+    dtype: "q8",
+    pooling: "cls",
+    usePrefix: false,
+  },
+  {
+    id: "granite-278m",
+    label: "granite-embedding-278m-multilingual（多言語・Apache-2.0・約265MB）",
+    backend: "transformers",
+    modelId: "yuiseki/granite-embedding-278m-multilingual-ONNX",
+    dtype: "q8",
+    pooling: "cls",
+    usePrefix: false,
+  },
+  {
+    id: "granite-311m-r2",
+    label: "granite-embedding-311m-multilingual-r2（多言語・Apache-2.0・約298MB・高精度）",
+    backend: "transformers",
+    modelId: "yuiseki/granite-embedding-311m-multilingual-r2-ONNX",
+    dtype: "q8",
+    pooling: "cls",
+    usePrefix: false,
+  },
+  {
+    id: "multilingual-e5-base",
+    label: "multilingual-e5-base（多言語・MIT・約265MB）",
+    backend: "transformers",
+    modelId: "onnx-community/multilingual-e5-base-ONNX",
+    dtype: "q8",
+    pooling: "mean",
+    usePrefix: true,
+  },
   {
     id: "bert_embedder",
     label: "MediaPipe BERT（約26MB・日本語可・速い）",
     backend: "mediapipe",
     url: "https://storage.googleapis.com/mediapipe-models/text_embedder/bert_embedder/float32/1/bert_embedder.tflite",
-  },
-  {
-    id: "multilingual-e5-base",
-    label: "multilingual-e5-base（多言語・MIT・約265MB・高精度）",
-    backend: "transformers",
-    modelId: "onnx-community/multilingual-e5-base-ONNX",
-    dtype: "q8",
-    usePrefix: true,
   },
   {
     id: "universal_sentence_encoder",
@@ -67,7 +108,7 @@ const EMBEDDING_MODELS: ModelConfig[] = [
   },
 ];
 
-const DEFAULT_MODEL_ID = "bert_embedder";
+const DEFAULT_MODEL_ID = "granite-97m-r2";
 
 // ベクトル検索の対象となる例文。日本語・英語をいろいろなトピックで混在させている。
 const DOCS = [
@@ -175,6 +216,7 @@ const createMediaPipeEmbedder = async (url: string): Promise<Embedder> => {
 const createTransformersEmbedder = async (
   modelId: string,
   dtype: string,
+  pooling: "mean" | "cls",
   usePrefix: boolean
 ): Promise<Embedder> => {
   const { pipeline } = await import("@huggingface/transformers");
@@ -185,9 +227,10 @@ const createTransformersEmbedder = async (
   const prefix = (kind: "query" | "passage") =>
     usePrefix ? (kind === "query" ? "query: " : "passage: ") : "";
   const run = async (text: string, kind: "query" | "passage") => {
-    // mean pooling + 正規化で 1 文 1 ベクトルにする
+    // モデルの定義に合わせた pooling + 正規化で 1 文 1 ベクトルにする
+    // (e5 系=mean, granite 系=cls)
     const out = await extractor(prefix(kind) + text, {
-      pooling: "mean",
+      pooling,
       normalize: true,
     });
     return Array.from(out.data as Float32Array).map((v) => Number(v));
@@ -206,7 +249,12 @@ const createEmbedder = (model: ModelConfig): Promise<Embedder> => {
   if (model.backend === "mediapipe") {
     return createMediaPipeEmbedder(model.url);
   }
-  return createTransformersEmbedder(model.modelId, model.dtype, model.usePrefix);
+  return createTransformersEmbedder(
+    model.modelId,
+    model.dtype,
+    model.pooling,
+    model.usePrefix
+  );
 };
 
 // 例文を埋め込み、DuckDB に VSS 用テーブルと HNSW インデックスを構築する。
@@ -409,10 +457,10 @@ function App() {
 
   return (
     <div>
-      <h1>DuckDB WASM VSS with MediaPipe - Demo App</h1>
+      <h1>DuckDB WASM VSS with MediaPipe / Transformers.js - Demo App</h1>
       <p>
-        This app demonstrates the integration of DuckDB VSS and MediaPipe
-        text-task with React.
+        This app demonstrates the integration of DuckDB VSS with text embeddings
+        from MediaPipe and Transformers.js (multilingual models) in React.
       </p>
       <div>
         <h2 style={{ textAlign: "left" }}>Embedding model:</h2>
