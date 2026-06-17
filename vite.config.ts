@@ -4,4 +4,6 @@ import react from '@vitejs/plugin-react'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  // GitHub Pages のプロジェクトページ配下で配信するための base
+  base: '/study-duckdb-wasm-vss/',
 })

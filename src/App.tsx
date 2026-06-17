@@ -69,8 +69,9 @@ const initEmbedding = async (
 ) => {
   const text = await import("@mediapipe/tasks-text");
   const { TextEmbedder, FilesetResolver } = text;
+  // wasm は CDN から取得する。node_modules 相対パスはビルド後(本番)では解決できないため。
   const textFiles = await FilesetResolver.forTextTasks(
-    "../node_modules/@mediapipe/tasks-text/wasm"
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-text@0.10.35/wasm"
   );
   const textEmbedder = await TextEmbedder.createFromOptions(textFiles, {
     baseOptions: {
