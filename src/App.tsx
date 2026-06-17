@@ -106,6 +106,52 @@ const DOCS = [
   "Database indexes are used to speed up searches.",
 ];
 
+// DOCS の内容から安定したハッシュを作る。例文を変更するとキャッシュが自動的に無効化される。
+const DOCS_HASH = (() => {
+  let h = 0;
+  const s = DOCS.join("");
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(36);
+})();
+
+const cacheKeyFor = (modelId: string) => `${modelId}__${DOCS_HASH}`;
+
+// OPFS に DOCS の埋め込みベクトルをキャッシュする。読めなければ null を返し、書き込み失敗は握りつぶす
+// (OPFS 非対応環境でも動くように)。これにより再読込・モデル再選択時の再埋め込みをスキップできる。
+const OPFS_CACHE_DIR = "vss-embeddings-cache";
+
+const readEmbeddingsCache = async (
+  key: string
+): Promise<number[][] | null> => {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle(OPFS_CACHE_DIR, { create: true });
+    const fh = await dir.getFileHandle(`${key}.json`);
+    const file = await fh.getFile();
+    return JSON.parse(await file.text());
+  } catch {
+    return null;
+  }
+};
+
+const writeEmbeddingsCache = async (
+  key: string,
+  vectors: number[][]
+): Promise<void> => {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle(OPFS_CACHE_DIR, { create: true });
+    const fh = await dir.getFileHandle(`${key}.json`, { create: true });
+    const writable = await fh.createWritable();
+    await writable.write(JSON.stringify(vectors));
+    await writable.close();
+  } catch (e) {
+    console.warn("OPFS への埋め込みキャッシュ書き込みに失敗:", e);
+  }
+};
+
 // MediaPipe バックエンドの Embedder を生成する。
 const createMediaPipeEmbedder = async (url: string): Promise<Embedder> => {
   const { TextEmbedder, FilesetResolver } = await import(
@@ -164,10 +210,30 @@ const createEmbedder = (model: ModelConfig): Promise<Embedder> => {
 };
 
 // 例文を埋め込み、DuckDB に VSS 用テーブルと HNSW インデックスを構築する。
-// 埋め込み次元はモデルによって異なるため embedder.dim を使う。
+// DOCS の埋め込みは OPFS にキャッシュし、あれば再埋め込みをスキップする(一番重い処理)。
 const buildDatabase = async (
-  embedder: Embedder
-): Promise<duckdb.AsyncDuckDB> => {
+  embedder: Embedder,
+  cacheKey: string
+): Promise<{ db: duckdb.AsyncDuckDB; dim: number; source: "cache" | "computed" }> => {
+  // まず OPFS キャッシュを試す。なければ埋め込みを計算して保存する。
+  let docVectors = await readEmbeddingsCache(cacheKey);
+  let source: "cache" | "computed";
+  if (docVectors && docVectors.length === DOCS.length) {
+    source = "cache";
+    console.log("DOCS の埋め込みを OPFS キャッシュから復元");
+  } else {
+    docVectors = [];
+    for (const doc of DOCS) {
+      docVectors.push(await embedder.embed(doc, "passage"));
+    }
+    await writeEmbeddingsCache(cacheKey, docVectors);
+    source = "computed";
+    console.log("DOCS の埋め込みを計算して OPFS に保存");
+  }
+
+  const dim = docVectors[0]?.length ?? embedder.dim;
+  if (!dim) throw new Error("埋め込み次元の判定に失敗しました");
+
   const worker = new duckdb_worker();
   const logger = new duckdb.VoidLogger();
   const db = new duckdb.AsyncDuckDB(logger, worker);
@@ -177,9 +243,6 @@ const buildDatabase = async (
   const conn = await db.connect();
   await conn.query("INSTALL vss;");
   await conn.query("LOAD vss;");
-
-  const dim = embedder.dim;
-  if (!dim) throw new Error("埋め込み次元の判定に失敗しました");
 
   await conn.query("CREATE SEQUENCE IF NOT EXISTS id_sequence START 1;");
   await conn.query(
@@ -192,12 +255,12 @@ const buildDatabase = async (
     `INSERT INTO embeddings VALUES (ARRAY[${placeholders}]);`
   );
 
-  for (const doc of DOCS) {
+  for (let i = 0; i < DOCS.length; i++) {
     const stmt = await conn.prepare("INSERT INTO sora_doc (content) VALUES (?);");
-    await stmt.query(doc);
+    await stmt.query(DOCS[i]);
     await stmt.close();
-    const vec = await embedder.embed(doc, "passage");
-    if (vec.length) {
+    const vec = docVectors[i];
+    if (vec && vec.length) {
       await stmt2.query(...vec);
     }
   }
@@ -206,7 +269,7 @@ const buildDatabase = async (
   await conn.query(`CREATE INDEX hnsw_index ON embeddings USING HNSW (vec);`);
   await conn.close();
 
-  return db;
+  return { db, dim, source };
 };
 
 function App() {
@@ -216,6 +279,9 @@ function App() {
   const [queryEmbedding, setQueryEmbedding] = useState<number[] | null>(null);
   const [myDuckDB, setMyDuckDB] = useState<duckdb.AsyncDuckDB | null>(null);
   const [embeddingDim, setEmbeddingDim] = useState<number | null>(null);
+  const [embeddingSource, setEmbeddingSource] = useState<
+    "cache" | "computed" | null
+  >(null);
   const [status, setStatus] = useState<"loading" | "ready" | "error">(
     "loading"
   );
@@ -234,6 +300,7 @@ function App() {
       setQueryEmbedding(null);
       setMyDuckDB(null);
       setEmbeddingDim(null);
+      setEmbeddingSource(null);
 
       // 旧インスタンスを破棄
       embedderRef.current?.close();
@@ -254,7 +321,10 @@ function App() {
         }
         embedderRef.current = embedder;
 
-        const db = await buildDatabase(embedder);
+        const { db, dim, source } = await buildDatabase(
+          embedder,
+          cacheKeyFor(selectedModelId)
+        );
         if (cancelled) {
           await db.terminate();
           return;
@@ -262,9 +332,10 @@ function App() {
         dbRef.current = db;
 
         setMyDuckDB(db);
-        setEmbeddingDim(embedder.dim);
+        setEmbeddingDim(dim);
+        setEmbeddingSource(source);
         setStatus("ready");
-        console.log(`Model "${selectedModelId}" ready (dim=${embedder.dim})`);
+        console.log(`Model "${selectedModelId}" ready (dim=${dim}, ${source})`);
       } catch (e) {
         if (!cancelled) {
           console.error("Failed to initialize embedding model:", e);
@@ -359,7 +430,14 @@ function App() {
             ))}
           </select>
           {status === "ready" && embeddingDim ? (
-            <span>次元数: {embeddingDim}</span>
+            <span>
+              次元数: {embeddingDim}
+              {embeddingSource === "cache"
+                ? "（OPFSキャッシュから復元）"
+                : embeddingSource === "computed"
+                ? "（埋め込みを計算しOPFSに保存）"
+                : ""}
+            </span>
           ) : null}
           {status === "loading" ? (
             <span>モデル読み込み中...（大きいモデルは時間がかかります）</span>
