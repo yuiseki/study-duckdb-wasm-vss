@@ -5,34 +5,67 @@ import * as duckdb from "@duckdb/duckdb-wasm";
 import duckdb_worker from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?worker";
 import duckdb_wasm from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
 import type { Table, StructRowProxy } from "apache-arrow";
-import { TextEmbedder, TextEmbedderResult } from "@mediapipe/tasks-text";
 
 // MediaPipe の wasm は CDN から取得する。node_modules 相対パスはビルド後(本番)では解決できないため。
 const MEDIAPIPE_WASM =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-text@0.10.35/wasm";
 
-// MediaPipe text-embedder が公開しているモデル。サイズが大きいほど精度が高い傾向だが
-// ダウンロード・初期化に時間がかかる。次元数はモデルによって異なるため実行時に判定する。
+// 埋め込みモデルの統一インターフェース。バックエンド(MediaPipe / Transformers.js)の差を吸収する。
+// e5 系は "query: " / "passage: " の接頭辞が必要なため kind を受け取る。
+type Embedder = {
+  dim: number;
+  embed: (text: string, kind: "query" | "passage") => Promise<number[]>;
+  close: () => void;
+};
+
+type ModelConfig =
+  | {
+      id: string;
+      label: string;
+      backend: "mediapipe";
+      url: string;
+    }
+  | {
+      id: string;
+      label: string;
+      backend: "transformers";
+      modelId: string;
+      dtype: string;
+      // e5 系は接頭辞が必要
+      usePrefix: boolean;
+    };
+
 // 注意: MediaPipe の Average Word / Universal Sentence Encoder は語彙ベースの英語専用で、
-// 空白で区切られない日本語文はすべて未知語となり同一ベクトルに潰れる（=検索が機能しない）。
-// 日本語で意味のある結果が得られるのは文字レベルに分割できる BERT のみ。
-const EMBEDDING_MODELS = [
+// 空白で区切られない日本語文はすべて未知語となり同一ベクトルに潰れる(=検索が機能しない)。
+// 日本語で意味のある結果が得られるのは BERT(文字レベル分割) か Transformers.js の多言語モデル。
+const EMBEDDING_MODELS: ModelConfig[] = [
   {
     id: "bert_embedder",
-    label: "BERT（約26MB・日本語対応・推奨）",
+    label: "MediaPipe BERT（約26MB・日本語可・速い）",
+    backend: "mediapipe",
     url: "https://storage.googleapis.com/mediapipe-models/text_embedder/bert_embedder/float32/1/bert_embedder.tflite",
   },
   {
+    id: "multilingual-e5-base",
+    label: "multilingual-e5-base（多言語・MIT・約265MB・高精度）",
+    backend: "transformers",
+    modelId: "onnx-community/multilingual-e5-base-ONNX",
+    dtype: "q8",
+    usePrefix: true,
+  },
+  {
     id: "universal_sentence_encoder",
-    label: "Universal Sentence Encoder（約6MB・英語のみ）",
+    label: "MediaPipe Universal Sentence Encoder（約6MB・英語のみ）",
+    backend: "mediapipe",
     url: "https://storage.googleapis.com/mediapipe-models/text_embedder/universal_sentence_encoder/float32/1/universal_sentence_encoder.tflite",
   },
   {
     id: "average_word_embedder",
-    label: "Average Word Embedding（約0.7MB・最速・英語のみ）",
+    label: "MediaPipe Average Word Embedding（約0.7MB・最速・英語のみ）",
+    backend: "mediapipe",
     url: "https://storage.googleapis.com/mediapipe-models/text_embedder/average_word_embedder/float32/1/average_word_embedder.tflite",
   },
-] as const;
+];
 
 const DEFAULT_MODEL_ID = "bert_embedder";
 
@@ -73,24 +106,68 @@ const DOCS = [
   "Database indexes are used to speed up searches.",
 ];
 
-// 指定したモデルで TextEmbedder を生成する。
-const createTextEmbedder = async (modelUrl: string): Promise<TextEmbedder> => {
+// MediaPipe バックエンドの Embedder を生成する。
+const createMediaPipeEmbedder = async (url: string): Promise<Embedder> => {
   const { TextEmbedder, FilesetResolver } = await import(
     "@mediapipe/tasks-text"
   );
   const textFiles = await FilesetResolver.forTextTasks(MEDIAPIPE_WASM);
-  return await TextEmbedder.createFromOptions(textFiles, {
-    baseOptions: {
-      modelAssetPath: modelUrl,
-    },
+  const te = await TextEmbedder.createFromOptions(textFiles, {
+    baseOptions: { modelAssetPath: url },
   });
+  const probe = te.embed("dimension probe");
+  const dim = probe.embeddings[0].floatEmbedding?.length ?? 0;
+  return {
+    dim,
+    embed: async (text) =>
+      Array.from(te.embed(text).embeddings[0].floatEmbedding ?? []),
+    close: () => te.close(),
+  };
 };
 
-// textEmbedder で例文を埋め込み、DuckDB に VSS 用テーブルと HNSW インデックスを構築する。
-// 埋め込み次元はモデルによって異なるため、最初の埋め込み結果から動的に決定する。
+// Transformers.js バックエンドの Embedder を生成する。
+const createTransformersEmbedder = async (
+  modelId: string,
+  dtype: string,
+  usePrefix: boolean
+): Promise<Embedder> => {
+  const { pipeline } = await import("@huggingface/transformers");
+  // dtype を指定して量子化版 ONNX をロードする(例: q8 -> model_quantized.onnx)
+  const extractor = await pipeline("feature-extraction", modelId, {
+    dtype: dtype as any,
+  });
+  const prefix = (kind: "query" | "passage") =>
+    usePrefix ? (kind === "query" ? "query: " : "passage: ") : "";
+  const run = async (text: string, kind: "query" | "passage") => {
+    // mean pooling + 正規化で 1 文 1 ベクトルにする
+    const out = await extractor(prefix(kind) + text, {
+      pooling: "mean",
+      normalize: true,
+    });
+    return Array.from(out.data as Float32Array).map((v) => Number(v));
+  };
+  const probe = await run("probe", "query");
+  return {
+    dim: probe.length,
+    embed: run,
+    close: () => {
+      void (extractor as any).dispose?.();
+    },
+  };
+};
+
+const createEmbedder = (model: ModelConfig): Promise<Embedder> => {
+  if (model.backend === "mediapipe") {
+    return createMediaPipeEmbedder(model.url);
+  }
+  return createTransformersEmbedder(model.modelId, model.dtype, model.usePrefix);
+};
+
+// 例文を埋め込み、DuckDB に VSS 用テーブルと HNSW インデックスを構築する。
+// 埋め込み次元はモデルによって異なるため embedder.dim を使う。
 const buildDatabase = async (
-  textEmbedder: TextEmbedder
-): Promise<{ db: duckdb.AsyncDuckDB; dim: number }> => {
+  embedder: Embedder
+): Promise<duckdb.AsyncDuckDB> => {
   const worker = new duckdb_worker();
   const logger = new duckdb.VoidLogger();
   const db = new duckdb.AsyncDuckDB(logger, worker);
@@ -101,12 +178,8 @@ const buildDatabase = async (
   await conn.query("INSTALL vss;");
   await conn.query("LOAD vss;");
 
-  // 埋め込み次元を判定する
-  const probe = textEmbedder.embed("dimension probe");
-  const dim = probe.embeddings[0].floatEmbedding?.length ?? 0;
-  if (dim === 0) {
-    throw new Error("埋め込み次元の判定に失敗しました");
-  }
+  const dim = embedder.dim;
+  if (!dim) throw new Error("埋め込み次元の判定に失敗しました");
 
   await conn.query("CREATE SEQUENCE IF NOT EXISTS id_sequence START 1;");
   await conn.query(
@@ -123,10 +196,9 @@ const buildDatabase = async (
     const stmt = await conn.prepare("INSERT INTO sora_doc (content) VALUES (?);");
     await stmt.query(doc);
     await stmt.close();
-    const embedding = textEmbedder.embed(doc);
-    const floatEmbedding = embedding.embeddings[0].floatEmbedding;
-    if (floatEmbedding) {
-      await stmt2.query(...floatEmbedding);
+    const vec = await embedder.embed(doc, "passage");
+    if (vec.length) {
+      await stmt2.query(...vec);
     }
   }
   await stmt2.close();
@@ -134,18 +206,14 @@ const buildDatabase = async (
   await conn.query(`CREATE INDEX hnsw_index ON embeddings USING HNSW (vec);`);
   await conn.close();
 
-  return { db, dim };
+  return db;
 };
 
 function App() {
   const [query, setQuery] = useState("こんにちは！ベクトル検索のデモです");
   const [selectedModelId, setSelectedModelId] =
     useState<string>(DEFAULT_MODEL_ID);
-  const [queryEmbedding, setQueryEmbedding] =
-    useState<TextEmbedderResult | null>(null);
-  const [myTextEmbedder, setMyTextEmbedder] = useState<TextEmbedder | null>(
-    null
-  );
+  const [queryEmbedding, setQueryEmbedding] = useState<number[] | null>(null);
   const [myDuckDB, setMyDuckDB] = useState<duckdb.AsyncDuckDB | null>(null);
   const [embeddingDim, setEmbeddingDim] = useState<number | null>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "error">(
@@ -154,7 +222,7 @@ function App() {
   const [resultRows, setResultRows] = useState<StructRowProxy<any>[]>([]);
   const debounceTimerRef = useRef<number | null>(null);
   // 旧インスタンスのクリーンアップ用
-  const embedderRef = useRef<TextEmbedder | null>(null);
+  const embedderRef = useRef<Embedder | null>(null);
   const dbRef = useRef<duckdb.AsyncDuckDB | null>(null);
 
   // モデル選択が変わるたびに、埋め込みモデルと DuckDB を作り直す。
@@ -164,7 +232,6 @@ function App() {
       setStatus("loading");
       setResultRows([]);
       setQueryEmbedding(null);
-      setMyTextEmbedder(null);
       setMyDuckDB(null);
       setEmbeddingDim(null);
 
@@ -180,25 +247,24 @@ function App() {
         const model =
           EMBEDDING_MODELS.find((m) => m.id === selectedModelId) ??
           EMBEDDING_MODELS[0];
-        const embedder = await createTextEmbedder(model.url);
+        const embedder = await createEmbedder(model);
         if (cancelled) {
           embedder.close();
           return;
         }
         embedderRef.current = embedder;
 
-        const { db, dim } = await buildDatabase(embedder);
+        const db = await buildDatabase(embedder);
         if (cancelled) {
           await db.terminate();
           return;
         }
         dbRef.current = db;
 
-        setMyTextEmbedder(embedder);
         setMyDuckDB(db);
-        setEmbeddingDim(dim);
+        setEmbeddingDim(embedder.dim);
         setStatus("ready");
-        console.log(`Model "${selectedModelId}" ready (dim=${dim})`);
+        console.log(`Model "${selectedModelId}" ready (dim=${embedder.dim})`);
       } catch (e) {
         if (!cancelled) {
           console.error("Failed to initialize embedding model:", e);
@@ -213,26 +279,25 @@ function App() {
   }, [selectedModelId]);
 
   // クエリを debounce して埋め込む
-  const debouncedEmbedQuery = useCallback(
-    (query: string) => {
-      if (!myTextEmbedder) return;
+  const debouncedEmbedQuery = useCallback((query: string) => {
+    if (!embedderRef.current) return;
 
-      if (debounceTimerRef.current !== null) {
-        window.clearTimeout(debounceTimerRef.current);
-      }
+    if (debounceTimerRef.current !== null) {
+      window.clearTimeout(debounceTimerRef.current);
+    }
 
-      debounceTimerRef.current = window.setTimeout(() => {
-        const newQueryEmbedding = myTextEmbedder.embed(query);
-        setQueryEmbedding(newQueryEmbedding);
-        debounceTimerRef.current = null;
-      }, 800);
-    },
-    [myTextEmbedder]
-  );
+    debounceTimerRef.current = window.setTimeout(async () => {
+      const embedder = embedderRef.current;
+      if (!embedder) return;
+      const vec = await embedder.embed(query, "query");
+      setQueryEmbedding(vec);
+      debounceTimerRef.current = null;
+    }, 800);
+  }, []);
 
   useEffect(() => {
     if (!query) return;
-    if (!myTextEmbedder) return;
+    if (status !== "ready") return;
 
     debouncedEmbedQuery(query);
 
@@ -241,19 +306,18 @@ function App() {
         window.clearTimeout(debounceTimerRef.current);
       }
     };
-  }, [query, myTextEmbedder, debouncedEmbedQuery]);
+  }, [query, status, debouncedEmbedQuery]);
 
   useEffect(() => {
     const doit = async () => {
       if (!myDuckDB) return;
-      if (!myTextEmbedder) return;
       if (!queryEmbedding) return;
       if (!embeddingDim) return;
 
       const conn = await myDuckDB.connect();
 
       const sql = `
-      SELECT c.*, array_distance(e.vec, [${queryEmbedding.embeddings[0].floatEmbedding?.join(
+      SELECT c.*, array_distance(e.vec, [${queryEmbedding.join(
         ","
       )}]::FLOAT[${embeddingDim}]) AS distance
       FROM embeddings e
@@ -270,7 +334,7 @@ function App() {
       await conn.close();
     };
     void doit();
-  }, [query, myDuckDB, myTextEmbedder, queryEmbedding, embeddingDim]);
+  }, [myDuckDB, queryEmbedding, embeddingDim]);
 
   return (
     <div>
@@ -297,7 +361,9 @@ function App() {
           {status === "ready" && embeddingDim ? (
             <span>次元数: {embeddingDim}</span>
           ) : null}
-          {status === "loading" ? <span>モデル読み込み中...</span> : null}
+          {status === "loading" ? (
+            <span>モデル読み込み中...（大きいモデルは時間がかかります）</span>
+          ) : null}
           {status === "error" ? (
             <span style={{ color: "red" }}>モデルの読み込みに失敗しました</span>
           ) : null}

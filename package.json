@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@duckdb/duckdb-wasm": "^1.33.1-dev45.0",
+    "@huggingface/transformers": "^4.2.0",
     "@mediapipe/tasks-text": "^0.10.35",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
