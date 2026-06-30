@@ -21,10 +21,21 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
+      # Transformers.js が DL する HuggingFace モデルをキャッシュし、毎回の再 DL を避ける
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-${{ hashFiles('src/lib/models.ts') }}
+          restore-keys: hf-models-
+      - name: Install deps
+        run: npm ci
+      # DOCS の埋め込みを事前計算し public/embeddings/*.parquet を生成する
+      # (ブラウザ側はこれを読むことで初回の DOCS 埋め込み計算をスキップできる)
+      - name: Precompute embeddings (parquet)
+        run: npm run precompute
       - name: Build page
-        run: |
-          npm ci
-          npm run build
+        run: npm run build
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v4
         with:

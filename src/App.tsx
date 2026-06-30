@@ -4,160 +4,27 @@ import "./App.css";
 import * as duckdb from "@duckdb/duckdb-wasm";
 import duckdb_worker from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?worker";
 import duckdb_wasm from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
-import type { Table, StructRowProxy } from "apache-arrow";
+import type { Table } from "apache-arrow";
+
+import { DOCS, cacheKeyFor, parquetFileNameFor } from "./lib/docs";
+import {
+  EMBEDDING_MODELS,
+  DEFAULT_MODEL_ID,
+  type ModelConfig,
+} from "./lib/models";
+import { type Embedder, createTransformersEmbedder } from "./lib/embedder";
 
 // MediaPipe の wasm は CDN から取得する。node_modules 相対パスはビルド後(本番)では解決できないため。
 const MEDIAPIPE_WASM =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-text@0.10.35/wasm";
 
-// 埋め込みモデルの統一インターフェース。バックエンド(MediaPipe / Transformers.js)の差を吸収する。
-// e5 系は "query: " / "passage: " の接頭辞が必要なため kind を受け取る。
-type Embedder = {
-  dim: number;
-  embed: (text: string, kind: "query" | "passage") => Promise<number[]>;
-  close: () => void;
-};
+// 事前計算済み(precompute)埋め込み parquet の URL。GitHub Pages 上の base 配下に配置される。
+// 例: /study-duckdb-wasm-vss/embeddings/granite-97m-r2__<hash>.parquet
+const parquetUrlFor = (modelId: string) =>
+  `${import.meta.env.BASE_URL}embeddings/${parquetFileNameFor(modelId)}`;
 
-type ModelConfig =
-  | {
-      id: string;
-      label: string;
-      backend: "mediapipe";
-      url: string;
-    }
-  | {
-      id: string;
-      label: string;
-      backend: "transformers";
-      modelId: string;
-      dtype: string;
-      // プーリング方式。e5 系は mean、granite 系は cls
-      pooling: "mean" | "cls";
-      // e5 系は "query: " / "passage: " 接頭辞が必要。granite 系は不要
-      usePrefix: boolean;
-    };
-
-// 注意: MediaPipe の Average Word / Universal Sentence Encoder は語彙ベースの英語専用で、
-// 空白で区切られない日本語文はすべて未知語となり同一ベクトルに潰れる(=検索が機能しない)。
-// 日本語で意味のある結果が得られるのは BERT(文字レベル分割) か Transformers.js の多言語モデル。
-const EMBEDDING_MODELS: ModelConfig[] = [
-  // granite 系(IBM, Apache-2.0)。多言語(日本語含む)対応、CLS プーリング、接頭辞なし。
-  // ONNX は yuiseki 自身が Apache-2.0 明示で再ホストしたもの。
-  {
-    id: "granite-97m-r2",
-    label: "granite-embedding-97m-multilingual-r2（多言語・Apache-2.0・約93MB・推奨）",
-    backend: "transformers",
-    modelId: "yuiseki/granite-embedding-97m-multilingual-r2-ONNX",
-    dtype: "q8",
-    pooling: "cls",
-    usePrefix: false,
-  },
-  {
-    id: "granite-107m",
-    label: "granite-embedding-107m-multilingual（多言語・Apache-2.0・約102MB）",
-    backend: "transformers",
-    modelId: "yuiseki/granite-embedding-107m-multilingual-ONNX",
-    dtype: "q8",
-    pooling: "cls",
-    usePrefix: false,
-  },
-  {
-    id: "granite-278m",
-    label: "granite-embedding-278m-multilingual（多言語・Apache-2.0・約265MB）",
-    backend: "transformers",
-    modelId: "yuiseki/granite-embedding-278m-multilingual-ONNX",
-    dtype: "q8",
-    pooling: "cls",
-    usePrefix: false,
-  },
-  {
-    id: "granite-311m-r2",
-    label: "granite-embedding-311m-multilingual-r2（多言語・Apache-2.0・約298MB・高精度）",
-    backend: "transformers",
-    modelId: "yuiseki/granite-embedding-311m-multilingual-r2-ONNX",
-    dtype: "q8",
-    pooling: "cls",
-    usePrefix: false,
-  },
-  {
-    id: "multilingual-e5-base",
-    label: "multilingual-e5-base（多言語・MIT・約265MB）",
-    backend: "transformers",
-    modelId: "onnx-community/multilingual-e5-base-ONNX",
-    dtype: "q8",
-    pooling: "mean",
-    usePrefix: true,
-  },
-  {
-    id: "bert_embedder",
-    label: "MediaPipe BERT（約26MB・日本語可・速い）",
-    backend: "mediapipe",
-    url: "https://storage.googleapis.com/mediapipe-models/text_embedder/bert_embedder/float32/1/bert_embedder.tflite",
-  },
-  {
-    id: "universal_sentence_encoder",
-    label: "MediaPipe Universal Sentence Encoder（約6MB・英語のみ）",
-    backend: "mediapipe",
-    url: "https://storage.googleapis.com/mediapipe-models/text_embedder/universal_sentence_encoder/float32/1/universal_sentence_encoder.tflite",
-  },
-  {
-    id: "average_word_embedder",
-    label: "MediaPipe Average Word Embedding（約0.7MB・最速・英語のみ）",
-    backend: "mediapipe",
-    url: "https://storage.googleapis.com/mediapipe-models/text_embedder/average_word_embedder/float32/1/average_word_embedder.tflite",
-  },
-];
-
-const DEFAULT_MODEL_ID = "granite-97m-r2";
-
-// ベクトル検索の対象となる例文。日本語・英語をいろいろなトピックで混在させている。
-const DOCS = [
-  "こんにちは！ベクトル検索のデモです",
-  "This is a demo of vector search",
-  "今日はとても良い天気です。",
-  "Today is a very nice day.",
-  "こんにちは、世界！",
-  "Hello, world!",
-  "ベクトル検索って何ですか？",
-  "What is vector search?",
-  "ベクトル検索は、情報検索の一種で、データをベクトル空間にマッピングし、類似性を測定する手法です。",
-  "明日は雨が降るみたいなので、傘を持って出かけましょう。",
-  "It looks like it will rain tomorrow, so let's bring an umbrella.",
-  "週末は家族と一緒に近くの公園でピクニックをしました。",
-  "We had a picnic with our family at a nearby park over the weekend.",
-  "猫はソファの上で気持ちよさそうに昼寝をしている。",
-  "The cat is taking a comfortable nap on the sofa.",
-  "新しいスマートフォンはカメラの性能が大幅に向上した。",
-  "The new smartphone has a significantly improved camera.",
-  "京都には歴史的な寺院や神社がたくさんあります。",
-  "Kyoto has many historical temples and shrines.",
-  "機械学習モデルの学習には大量のデータと計算資源が必要だ。",
-  "Training a machine learning model requires a lot of data and compute.",
-  "朝食にトーストとコーヒーを楽しむのが日課です。",
-  "Enjoying toast and coffee for breakfast is my daily routine.",
-  "電車が遅延したため、会議に少し遅刻してしまった。",
-  "The train was delayed, so I was a little late for the meeting.",
-  "この本はプログラミング初心者にとてもおすすめです。",
-  "This book is highly recommended for programming beginners.",
-  "海辺で夕日を眺めるのはとてもロマンチックだ。",
-  "Watching the sunset by the sea is very romantic.",
-  "健康のために毎朝30分のジョギングを続けている。",
-  "I keep jogging for 30 minutes every morning to stay healthy.",
-  "データベースのインデックスは検索を高速化するために使われる。",
-  "Database indexes are used to speed up searches.",
-];
-
-// DOCS の内容から安定したハッシュを作る。例文を変更するとキャッシュが自動的に無効化される。
-const DOCS_HASH = (() => {
-  let h = 0;
-  const s = DOCS.join("");
-  for (let i = 0; i < s.length; i++) {
-    h = (h * 31 + s.charCodeAt(i)) | 0;
-  }
-  return (h >>> 0).toString(36);
-})();
-
-const cacheKeyFor = (modelId: string) => `${modelId}__${DOCS_HASH}`;
+// 検索結果 1 行。sora_doc の id/content に距離を加えたもの。
+type ResultRow = { id: number; content: string; distance: number };
 
 // OPFS に DOCS の埋め込みベクトルをキャッシュする。読めなければ null を返し、書き込み失敗は握りつぶす
 // (OPFS 非対応環境でも動くように)。これにより再読込・モデル再選択時の再埋め込みをスキップできる。
@@ -212,39 +79,6 @@ const createMediaPipeEmbedder = async (url: string): Promise<Embedder> => {
   };
 };
 
-// Transformers.js バックエンドの Embedder を生成する。
-const createTransformersEmbedder = async (
-  modelId: string,
-  dtype: string,
-  pooling: "mean" | "cls",
-  usePrefix: boolean
-): Promise<Embedder> => {
-  const { pipeline } = await import("@huggingface/transformers");
-  // dtype を指定して量子化版 ONNX をロードする(例: q8 -> model_quantized.onnx)
-  const extractor = await pipeline("feature-extraction", modelId, {
-    dtype: dtype as any,
-  });
-  const prefix = (kind: "query" | "passage") =>
-    usePrefix ? (kind === "query" ? "query: " : "passage: ") : "";
-  const run = async (text: string, kind: "query" | "passage") => {
-    // モデルの定義に合わせた pooling + 正規化で 1 文 1 ベクトルにする
-    // (e5 系=mean, granite 系=cls)
-    const out = await extractor(prefix(kind) + text, {
-      pooling,
-      normalize: true,
-    });
-    return Array.from(out.data as Float32Array).map((v) => Number(v));
-  };
-  const probe = await run("probe", "query");
-  return {
-    dim: probe.length,
-    embed: run,
-    close: () => {
-      void (extractor as any).dispose?.();
-    },
-  };
-};
-
 const createEmbedder = (model: ModelConfig): Promise<Embedder> => {
   if (model.backend === "mediapipe") {
     return createMediaPipeEmbedder(model.url);
@@ -257,31 +91,67 @@ const createEmbedder = (model: ModelConfig): Promise<Embedder> => {
   );
 };
 
-// 例文を埋め込み、DuckDB に VSS 用テーブルと HNSW インデックスを構築する。
-// DOCS の埋め込みは OPFS にキャッシュし、あれば再埋め込みをスキップする(一番重い処理)。
-const buildDatabase = async (
-  embedder: Embedder,
-  cacheKey: string
-): Promise<{ db: duckdb.AsyncDuckDB; dim: number; source: "cache" | "computed" }> => {
-  // まず OPFS キャッシュを試す。なければ埋め込みを計算して保存する。
-  let docVectors = await readEmbeddingsCache(cacheKey);
-  let source: "cache" | "computed";
-  if (docVectors && docVectors.length === DOCS.length) {
-    source = "cache";
-    console.log("DOCS の埋め込みを OPFS キャッシュから復元");
-  } else {
-    docVectors = [];
-    for (const doc of DOCS) {
-      docVectors.push(await embedder.embed(doc, "passage"));
-    }
-    await writeEmbeddingsCache(cacheKey, docVectors);
-    source = "computed";
-    console.log("DOCS の埋め込みを計算して OPFS に保存");
+// GitHub Pages に置かれた事前計算済み parquet から DOCS の埋め込みを読み込む。
+// 見つからない/読めない場合は null を返し、呼び出し側でその場計算にフォールバックする。
+const loadParquetVectors = async (
+  db: duckdb.AsyncDuckDB,
+  modelId: string
+): Promise<number[][] | null> => {
+  const url = parquetUrlFor(modelId);
+  // まず HEAD で存在確認(404 のときに parquet パースを試みて警告を出すのを避ける)
+  try {
+    const head = await fetch(url, { method: "HEAD" });
+    if (!head.ok) return null;
+  } catch {
+    return null;
   }
 
-  const dim = docVectors[0]?.length ?? embedder.dim;
-  if (!dim) throw new Error("埋め込み次元の判定に失敗しました");
+  const fileName = parquetFileNameFor(modelId);
+  try {
+    // モデル再選択で再登録されても問題ないよう、先に dropFile しておく
+    await db.dropFile(fileName).catch(() => {});
+    await db.registerFileURL(
+      fileName,
+      url,
+      duckdb.DuckDBDataProtocol.HTTP,
+      false
+    );
+    const conn = await db.connect();
+    try {
+      const tbl = await conn.query(
+        `SELECT vec FROM read_parquet('${fileName}') ORDER BY id`
+      );
+      const vecCol = tbl.getChild("vec");
+      if (!vecCol || tbl.numRows !== DOCS.length) return null;
+      const vectors: number[][] = [];
+      for (let i = 0; i < tbl.numRows; i++) {
+        const cell = vecCol.get(i) as Iterable<number> | null;
+        if (!cell) return null;
+        vectors.push(Array.from(cell, Number));
+      }
+      return vectors;
+    } finally {
+      await conn.close();
+    }
+  } catch (e) {
+    console.warn("parquet の読み込みに失敗。埋め込みを計算します:", e);
+    return null;
+  }
+};
 
+// 例文を埋め込み、DuckDB に VSS 用テーブルと HNSW インデックスを構築する。
+// DOCS の埋め込み(一番重い処理)は次の優先順位で解決し、重い計算を可能な限り避ける:
+//   1. OPFS キャッシュ (端末ローカル・最速)
+//   2. 事前計算済み parquet (GitHub Pages・CI で計算済み)
+//   3. その場で埋め込み計算 (フォールバック)
+const buildDatabase = async (
+  embedder: Embedder,
+  modelId: string
+): Promise<{
+  db: duckdb.AsyncDuckDB;
+  dim: number;
+  source: "cache" | "precomputed" | "computed";
+}> => {
   const worker = new duckdb_worker();
   const logger = new duckdb.VoidLogger();
   const db = new duckdb.AsyncDuckDB(logger, worker);
@@ -291,6 +161,32 @@ const buildDatabase = async (
   const conn = await db.connect();
   await conn.query("INSTALL vss;");
   await conn.query("LOAD vss;");
+
+  const cacheKey = cacheKeyFor(modelId);
+  let docVectors = await readEmbeddingsCache(cacheKey);
+  let source: "cache" | "precomputed" | "computed";
+  if (docVectors && docVectors.length === DOCS.length) {
+    source = "cache";
+    console.log("DOCS の埋め込みを OPFS キャッシュから復元");
+  } else {
+    docVectors = await loadParquetVectors(db, modelId);
+    if (docVectors) {
+      await writeEmbeddingsCache(cacheKey, docVectors);
+      source = "precomputed";
+      console.log("DOCS の埋め込みを事前計算 parquet から復元");
+    } else {
+      docVectors = [];
+      for (const doc of DOCS) {
+        docVectors.push(await embedder.embed(doc, "passage"));
+      }
+      await writeEmbeddingsCache(cacheKey, docVectors);
+      source = "computed";
+      console.log("DOCS の埋め込みを計算して OPFS に保存");
+    }
+  }
+
+  const dim = docVectors[0]?.length ?? embedder.dim;
+  if (!dim) throw new Error("埋め込み次元の判定に失敗しました");
 
   await conn.query("CREATE SEQUENCE IF NOT EXISTS id_sequence START 1;");
   await conn.query(
@@ -328,12 +224,12 @@ function App() {
   const [myDuckDB, setMyDuckDB] = useState<duckdb.AsyncDuckDB | null>(null);
   const [embeddingDim, setEmbeddingDim] = useState<number | null>(null);
   const [embeddingSource, setEmbeddingSource] = useState<
-    "cache" | "computed" | null
+    "cache" | "precomputed" | "computed" | null
   >(null);
   const [status, setStatus] = useState<"loading" | "ready" | "error">(
     "loading"
   );
-  const [resultRows, setResultRows] = useState<StructRowProxy<any>[]>([]);
+  const [resultRows, setResultRows] = useState<ResultRow[]>([]);
   const debounceTimerRef = useRef<number | null>(null);
   // 旧インスタンスのクリーンアップ用
   const embedderRef = useRef<Embedder | null>(null);
@@ -371,7 +267,7 @@ function App() {
 
         const { db, dim, source } = await buildDatabase(
           embedder,
-          cacheKeyFor(selectedModelId)
+          selectedModelId
         );
         if (cancelled) {
           await db.terminate();
@@ -445,9 +341,9 @@ function App() {
       LIMIT 10;
     `;
       const newResults: Table = await conn.query(sql);
-      const newResultRows: StructRowProxy<any>[] = newResults
+      const newResultRows: ResultRow[] = newResults
         .toArray()
-        .map((row: any) => JSON.parse(row));
+        .map((row) => JSON.parse(String(row)) as ResultRow);
 
       setResultRows(newResultRows);
       await conn.close();
@@ -482,6 +378,8 @@ function App() {
               次元数: {embeddingDim}
               {embeddingSource === "cache"
                 ? "（OPFSキャッシュから復元）"
+                : embeddingSource === "precomputed"
+                ? "（事前計算 parquet から復元）"
                 : embeddingSource === "computed"
                 ? "（埋め込みを計算しOPFSに保存）"
                 : ""}

@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# 事前計算した埋め込み parquet は CI(または手元の npm run precompute)で生成する成果物
+public/embeddings/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

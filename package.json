@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "precompute": "tsx scripts/precompute-embeddings.ts"
   },
   "dependencies": {
     "@duckdb/duckdb-wasm": "^1.33.1-dev45.0",
@@ -17,6 +18,7 @@
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
+    "@duckdb/node-api": "^1.5.4-r.1",
     "@eslint/js": "^10.0.1",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
@@ -25,6 +27,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.3",
     "globals": "^17.6.0",
+    "tsx": "^4.22.4",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.61.1",
     "vite": "^8.0.16",
