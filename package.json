@@ -28,7 +28,7 @@
     "eslint-plugin-react-refresh": "^0.5.3",
     "globals": "^17.6.0",
     "tsx": "^4.22.4",
-    "typescript": "~6.0.3",
+    "typescript": "~7.0.0",
     "typescript-eslint": "^8.61.1",
     "vite": "^8.0.16",
     "vite-plugin-wasm": "^3.6.0"
